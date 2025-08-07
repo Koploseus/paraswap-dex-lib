@@ -219,6 +219,7 @@ const Dexes = [
   RingV2,
   UsdcTransmuter,
   AirSwap,
+  UsdcTransmuter,
 ];
 
 export type LegacyDexConstructor = new (dexHelper: IDexHelper) => IDexTxBuilder<
