@@ -1,80 +1,205 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-import { ethers } from 'ethers';
+import https from 'https';
 import { DummyDexHelper } from '../../dex-helper';
 import { Network, SwapSide } from '../../constants';
-import { AirSwap } from './airswap';
+import { AirSwap, MIN_EXPIRY } from './airswap';
 import { checkPoolPrices, sleep } from '../../../tests/utils';
-import { BI_POWS } from '../../bigint-constants';
-import { startTestServer } from './test-server.test';
-import { Tokens as SmartTokens } from '../../../tests/constants-e2e';
-
-const PK_KEY = process.env.TEST_PK_KEY;
-if (!PK_KEY) {
-  throw new Error('Mising TEST_PK_KEY');
-}
-
-const testAccount = new ethers.Wallet(PK_KEY!);
-
-const stopServer = startTestServer(testAccount);
-process.env.AIRSWAP_SERVER_URLS_1 = `http://localhost:${stopServer.port}`;
-
-const smartTokens = SmartTokens[1];
-const WETH = smartTokens.WETH;
-const DAI = smartTokens.DAI;
-
-const amountsForSell = [
-  0n,
-  1n * BI_POWS[WETH.decimals],
-  2n * BI_POWS[WETH.decimals],
-  3n * BI_POWS[WETH.decimals],
-  4n * BI_POWS[WETH.decimals],
-  5n * BI_POWS[WETH.decimals],
-  6n * BI_POWS[WETH.decimals],
-  7n * BI_POWS[WETH.decimals],
-  8n * BI_POWS[WETH.decimals],
-  9n * BI_POWS[WETH.decimals],
-  10n * BI_POWS[WETH.decimals],
-];
+import { AirSwapConfig } from './config';
+import { ForwarderClient } from './forwarder-client';
+import { Token } from '../../types';
 
 const dexKey = 'AirSwap';
-
 describe('AirSwap', function () {
-  it('getPoolIdentifiers and getPricesVolume', async function () {
-    const dexHelper = new DummyDexHelper(Network.MAINNET);
-    const blocknumber = await dexHelper.web3Provider.eth.getBlockNumber();
-    const airswapInstance = new AirSwap(Network.MAINNET, dexKey, dexHelper);
+  describe('Sepolia', () => {
+    const network = Network.SEPOLIA;
+    let dexHelper: DummyDexHelper;
 
-    airswapInstance.initializePricing(blocknumber);
-    await sleep(5000);
+    const forwarderTokens: { signer: Token; sender: Token } = {
+      signer: {
+        address: '0x20aaebad8c7c6ffb6fdaa5a622c399561562beea',
+        decimals: 6,
+      },
+      sender: {
+        address: '0xf450ef4f268eaf2d3d8f9ed0354852e255a5eaef',
+        decimals: 6,
+      },
+    };
 
-    const pools = await airswapInstance.getPoolIdentifiers(
-      WETH,
-      DAI,
-      SwapSide.SELL,
-      blocknumber,
-    );
-    expect(pools.length).toBeGreaterThan(0);
-    const poolPrices = await airswapInstance.getPricesVolume(
-      WETH,
-      DAI,
-      amountsForSell,
-      SwapSide.SELL,
-      blocknumber,
-      pools,
-    );
+    let originalSetTimeout: typeof setTimeout;
+    const activeTimeouts = new Set<NodeJS.Timeout>();
+    let getBlockNumberMock: jest.SpiedFunction<
+      typeof DummyDexHelper.prototype.web3Provider.eth.getBlockNumber
+    >;
 
-    expect(poolPrices).not.toBeNull();
-    checkPoolPrices(poolPrices!, amountsForSell, SwapSide.SELL, dexKey);
+    const atomic = (value: number) => BigInt(value) * 1_000_000n;
+    const amountsForSell = [
+      0n,
+      atomic(1),
+      atomic(2),
+      atomic(3),
+      atomic(4),
+      atomic(5),
+    ];
 
-    // store instance for cleanup
-    (global as any).airswapTestInstance = airswapInstance;
+    let blockNumber: number;
+    let airswap: AirSwap;
+
+    beforeAll(async () => {
+      originalSetTimeout = global.setTimeout;
+      global.setTimeout = ((
+        handler: (...args: any[]) => void,
+        timeout?: number,
+        ...args: any[]
+      ) => {
+        const handle = originalSetTimeout(
+          handler,
+          timeout,
+          ...args,
+        ) as NodeJS.Timeout;
+        activeTimeouts.add(handle);
+        return handle;
+      }) as typeof setTimeout;
+
+      dexHelper = new DummyDexHelper(network);
+
+      getBlockNumberMock = jest
+        .spyOn(dexHelper.web3Provider.eth, 'getBlockNumber')
+        .mockResolvedValue(0 as any);
+
+      blockNumber = await dexHelper.web3Provider.eth.getBlockNumber();
+      airswap = new AirSwap(network, dexKey, dexHelper);
+      await airswap.initializePricing(blockNumber);
+      await sleep(5000); // Wait for forwarder pricing to be fetched
+    });
+
+    afterAll(() => {
+      airswap?.releaseResources();
+      getBlockNumberMock?.mockRestore();
+      activeTimeouts.forEach(timeoutId => {
+        clearTimeout(timeoutId as any);
+      });
+      activeTimeouts.clear();
+      global.setTimeout = originalSetTimeout;
+    });
+
+    it('getPoolIdentifiers and getPricesVolume SELL', async function () {
+      const pools = await airswap.getPoolIdentifiers(
+        forwarderTokens.signer,
+        forwarderTokens.sender,
+        SwapSide.SELL,
+        blockNumber,
+      );
+      console.log(`Forwarder signer -> sender Pool Identifiers:`, pools);
+      expect(pools.length).toBeGreaterThan(0);
+
+      const poolPrices = await airswap.getPricesVolume(
+        forwarderTokens.signer,
+        forwarderTokens.sender,
+        amountsForSell,
+        SwapSide.SELL,
+        blockNumber,
+        pools,
+      );
+      console.log(`Forwarder signer -> sender Pool Prices:`, poolPrices);
+
+      expect(poolPrices).not.toBeNull();
+      checkPoolPrices(poolPrices!, amountsForSell, SwapSide.SELL, dexKey);
+    });
   });
 
-  afterAll(() => {
-    stopServer();
-    const instance = (global as any).airswapTestInstance as AirSwap | undefined;
-    instance?.releaseResources();
+  describe('Forwarder Live RFQ', () => {
+    const network = Network.SEPOLIA;
+    const dexHelper = new DummyDexHelper(network);
+    const config = AirSwapConfig.AirSwap[network];
+    const logger = dexHelper.getLogger(dexKey);
+    const forwarderClient = new ForwarderClient(dexHelper, logger, {
+      forwarderUrl: config.forwarderUrl,
+      forwarderHealthUrl: config.forwarderHealthUrl,
+    });
+
+    const signerToken = '0x20aaebad8c7c6ffb6fdaa5a622c399561562beea';
+    const senderToken = '0xf450ef4f268eaf2d3d8f9ed0354852e255a5eaef';
+    const amount = '1000000';
+    const wallet = '0x0000000000000000000000000000000000000001';
+
+    const baseParams = {
+      chainId: network.toString(),
+      swapContract: config.swapERC20Address,
+      signerToken,
+      senderToken,
+      senderWallet: wallet,
+      minExpiry: MIN_EXPIRY.toString(),
+      proxyingFor: wallet,
+    };
+
+    it('fetches signer-side order (SELL)', async () => {
+      const { request } = dexHelper.httpRequest;
+      const agent = new https.Agent({ keepAlive: false });
+      const requestSpy = jest
+        .spyOn(dexHelper.httpRequest, 'request')
+        .mockImplementationOnce(async config => {
+          try {
+            return await request.call(dexHelper.httpRequest, {
+              ...config,
+              httpAgent: agent,
+              httpsAgent: agent,
+            });
+          } finally {
+            agent.destroy();
+          }
+        });
+
+      const order = await forwarderClient.getSignerSideOrderERC20({
+        ...baseParams,
+        senderAmount: amount,
+      });
+
+      expect(order.signerToken.toLowerCase()).toBe(signerToken.toLowerCase());
+      expect(order.senderToken.toLowerCase()).toBe(senderToken.toLowerCase());
+      expect(order.senderAmount).toBe(amount);
+      expect(BigInt(order.expiry)).toBeGreaterThan(
+        BigInt(Math.floor(Date.now() / 1000)),
+      );
+      expect(order.r).toBeTruthy();
+      expect(order.s).toBeTruthy();
+
+      requestSpy.mockRestore();
+    });
+
+    it('fetches sender-side order (BUY)', async () => {
+      const { request } = dexHelper.httpRequest;
+      const agent = new https.Agent({ keepAlive: false });
+      const requestSpy = jest
+        .spyOn(dexHelper.httpRequest, 'request')
+        .mockImplementationOnce(async config => {
+          try {
+            return await request.call(dexHelper.httpRequest, {
+              ...config,
+              httpAgent: agent,
+              httpsAgent: agent,
+            });
+          } finally {
+            agent.destroy();
+          }
+        });
+
+      const order = await forwarderClient.getSenderSideOrderERC20({
+        ...baseParams,
+        signerAmount: amount,
+      });
+
+      expect(order.signerToken.toLowerCase()).toBe(signerToken.toLowerCase());
+      expect(order.senderToken.toLowerCase()).toBe(senderToken.toLowerCase());
+      expect(order.signerAmount).toBe(amount);
+      expect(BigInt(order.expiry)).toBeGreaterThan(
+        BigInt(Math.floor(Date.now() / 1000)),
+      );
+      expect(order.r).toBeTruthy();
+      expect(order.s).toBeTruthy();
+
+      requestSpy.mockRestore();
+    });
   });
 });
