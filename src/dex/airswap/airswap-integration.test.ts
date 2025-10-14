@@ -122,7 +122,7 @@ describe('AirSwap', function () {
     const signerToken = '0x20aaebad8c7c6ffb6fdaa5a622c399561562beea';
     const senderToken = '0xf450ef4f268eaf2d3d8f9ed0354852e255a5eaef';
     const amount = '1000000';
-    const wallet = '0x0000000000000000000000000000000000000001';
+    const wallet = '0x1D693a4425bf7eD10FE7775E2b65b072019FFceb';
 
     const baseParams = {
       chainId: network.toString(),

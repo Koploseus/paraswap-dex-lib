@@ -2,7 +2,12 @@ import { Interface } from 'ethers/lib/utils';
 import { assert } from 'ts-essentials';
 import { OptimalSwapExchange } from '@paraswap/core';
 import SwapERC20 from '@airswap/swap-erc20/build/contracts/SwapERC20.sol/SwapERC20.json';
-import { getCostByPricing, Pricing } from '@airswap/utils';
+import {
+  getCostByPricing,
+  Pricing,
+  toDecimalString,
+  toAtomicString,
+} from '@airswap/utils';
 
 import { Fetcher, SkippingRequest } from '../../lib/fetcher/fetcher';
 import {
@@ -228,14 +233,29 @@ export class AirSwap
           const lookupBase = isSell ? _srcToken.address : _destToken.address;
           const lookupQuote = isSell ? _destToken.address : _srcToken.address;
 
-          const price = getCostByPricing(
-            makerSide,
+          const baseToken = this.dexHelper.config.wrapETH(
+            isSell ? srcToken : destToken,
+          );
+          const quoteToken = this.dexHelper.config.wrapETH(
+            isSell ? destToken : srcToken,
+          );
+
+          const amountDecimal = toDecimalString(
             amount.toString(),
+            baseToken.decimals ?? 18,
+          );
+          const costDecimal = getCostByPricing(
+            makerSide,
+            amountDecimal,
             lookupBase,
             lookupQuote,
             pricing,
           );
-          prices.push(BigInt(price ?? 0));
+          const costAtomic = toAtomicString(
+            costDecimal,
+            quoteToken.decimals ?? 18,
+          );
+          prices.push(BigInt(costAtomic));
         } catch (e) {
           prices.push(BigInt(0));
         }
@@ -287,10 +307,11 @@ export class AirSwap
     const _destToken = this.dexHelper.config.wrapETH(destToken);
 
     // Build order params
+    // senderWallet must be the actual caller of SwapERC20.swapLight (the executor)
     const params: any = {
       chainId: this.network.toString(),
       swapContract: this.swapERC20Address,
-      senderWallet: this.augustusAddress,
+      senderWallet: options.executionContractAddress,
       minExpiry: MIN_EXPIRY.toString(),
       proxyingFor: options.txOrigin,
     };
@@ -298,16 +319,16 @@ export class AirSwap
     let order;
 
     if (side === SwapSide.SELL) {
-      // SELL: provide srcAmount
-      params.senderToken = _destToken.address;
+      // SELL: sender gives srcToken, signer gives destToken
+      params.senderToken = _srcToken.address;
       params.senderAmount = optimalSwapExchange.srcAmount;
-      params.signerToken = _srcToken.address;
+      params.signerToken = _destToken.address;
       order = await this.forwarderClient.getSignerSideOrderERC20(params);
     } else {
-      // BUY: want destAmount
+      // BUY: sender gives srcToken, signer gives destToken (but we specify signer amount)
+      params.senderToken = _srcToken.address;
       params.signerToken = _destToken.address;
       params.signerAmount = optimalSwapExchange.destAmount;
-      params.senderToken = _srcToken.address;
       order = await this.forwarderClient.getSenderSideOrderERC20(params);
     }
 
@@ -342,6 +363,7 @@ export class AirSwap
     );
 
     const values = [
+      this.augustusAddress, // recipient
       order.nonce,
       order.expiry,
       order.signerWallet,
@@ -354,7 +376,7 @@ export class AirSwap
       order.s,
     ];
 
-    const swapData = this.swapInterface.encodeFunctionData('swapLight', values);
+    const swapData = this.swapInterface.encodeFunctionData('swap', values);
 
     return this.buildSimpleParamWithoutWETHConversion(
       order.senderToken,
@@ -408,6 +430,43 @@ export class AirSwap
     poolPrices: PoolPrices<AirSwapOrderResponse>,
   ): number | number[] {
     return CALLDATA_GAS_COST.DEX_NO_PAYLOAD;
+  }
+  // V6 non-direct path: provide DexExchangeParam for GenericSwapTransactionBuilder
+  async getDexParam(
+    srcToken: string,
+    destToken: string,
+    srcAmount: string,
+    destAmount: string,
+    recipient: string,
+    data: AirSwapOrderResponse,
+    side: SwapSide,
+    flags?: { isGlobalSrcToken: boolean; isGlobalDestToken: boolean },
+    executorAddress?: string,
+  ) {
+    const { order } = data;
+    assert(order, `${this.dexKey}-${this.network}: order undefined`);
+
+    const exchangeData = this.swapInterface.encodeFunctionData('swap', [
+      recipient,
+      order.nonce,
+      order.expiry,
+      order.signerWallet,
+      order.signerToken,
+      order.signerAmount,
+      order.senderToken,
+      order.senderAmount,
+      order.v,
+      order.r,
+      order.s,
+    ]);
+
+    return {
+      needWrapNative: this.needWrapNative,
+      dexFuncHasRecipient: true,
+      exchangeData,
+      targetExchange: this.swapERC20Address,
+      specialDexSupportsInsertFromAmount: true,
+    };
   }
   getAdapterParam(
     srcToken: string,
